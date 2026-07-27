@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: telegram-monospace-bot
+    env: docker
+    plan: free
+    autoDeploy: true
+    dockerfilePath: Dockerfile
+    buildCommand: ""
+    startCommand: python run.py
+    instanceType: starter
+    disk: 512
+    healthCheckPath: /
+    envVars:
+      - key: BOT_TOKEN
+        fromDatabase: false
+        required: true
+        description: "Telegram bot token (format: 123456:ABC-DEF...)"
+    public: false
+    regions:
+      - oregon
+    secrets: []
