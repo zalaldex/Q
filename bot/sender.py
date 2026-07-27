@@ -15,8 +15,8 @@ Notes:
 from __future__ import annotations
 
 import asyncio
-import math
-from typing import Any, Iterable, List, Optional
+import random
+from typing import Any, Iterable, List, Optional, Callable, Awaitable
 
 from .chunker import chunk_monospace_message
 from .constants import TELEGRAM_MAX_MESSAGE_LENGTH, SENDER_RETRY_ATTEMPTS, SENDER_BACKOFF_BASE
@@ -25,7 +25,13 @@ from .logger import get_logger
 LOG = get_logger(__name__)
 
 
-async def send_with_retries(fn, *args, attempts: int = SENDER_RETRY_ATTEMPTS, backoff_base: float = SENDER_BACKOFF_BASE, **kwargs):
+async def send_with_retries(
+    fn: Callable[..., Awaitable[Any]],
+    *args,
+    attempts: int = SENDER_RETRY_ATTEMPTS,
+    backoff_base: float = SENDER_BACKOFF_BASE,
+    **kwargs,
+) -> Any:
     """Call async function `fn(*args, **kwargs)` with retries and exponential backoff.
 
     On success returns fn(...) result. On persistent failure re-raises the last exception.
@@ -38,11 +44,12 @@ async def send_with_retries(fn, *args, attempts: int = SENDER_RETRY_ATTEMPTS, ba
         except Exception as exc:
             last_exc = exc
             wait = backoff_base * (2 ** (attempt - 1))
-            jitter = wait * 0.1 * (2 * (math.random() - 0.5) if hasattr(math, 'random') else 0)
+            # jitter in range +/-10%
+            jitter = (random.random() - 0.5) * 0.2 * wait
             wait = max(0.1, wait + jitter)
             LOG.warning("Send attempt %s failed, retrying in %.2fs: %s", attempt, wait, exc)
             await asyncio.sleep(wait)
-    # If we get here, re-raise
+    # If we get here, re-raise the last exception
     raise last_exc
 
 
@@ -55,7 +62,7 @@ async def send_text_chunks(bot, chat_id: int, chunks: Iterable[str], parse_mode:
     for chunk in chunks:
         if not chunk:
             continue
-        # pick send method
+
         async def _send():
             return await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=parse_mode)
 
@@ -69,7 +76,14 @@ async def send_text_chunks(bot, chat_id: int, chunks: Iterable[str], parse_mode:
     return results
 
 
-async def send_transformed(bot, chat_id: int, html_text: str, *, media_paths: Optional[List[str]] = None, parse_mode: str = "HTML") -> List[Any]:
+async def send_transformed(
+    bot,
+    chat_id: int,
+    html_text: str,
+    *,
+    media_paths: Optional[List[str]] = None,
+    parse_mode: str = "HTML",
+) -> List[Any]:
     """Send transformed HTML-safe monospace text, chunking it to fit limits.
 
     If media_paths is provided (list of local file paths), the function will attempt to
@@ -88,17 +102,19 @@ async def send_transformed(bot, chat_id: int, html_text: str, *, media_paths: Op
 
     # If there are media files and at least one chunk, try to send a media group with caption
     if media_paths:
-        # Build media objects for telegram; try to import InputMedia* dynamically to avoid hard dependency on specific PTB version
         try:
+            # Import PTB media classes dynamically to avoid hard dependency
             from telegram import InputMediaPhoto, InputMediaDocument
 
             media_objs = []
+            file_objs = []
             for p in media_paths:
-                # choose Photo vs Document by extension heuristics
-                if str(p).lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp')):
-                    media_objs.append(InputMediaPhoto(media=open(p, 'rb')))
+                f = open(p, "rb")
+                file_objs.append(f)
+                if str(p).lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp")):
+                    media_objs.append(InputMediaPhoto(media=f))
                 else:
-                    media_objs.append(InputMediaDocument(media=open(p, 'rb')))
+                    media_objs.append(InputMediaDocument(media=f))
 
             # attach first chunk as caption if fits
             if chunks:
@@ -107,28 +123,35 @@ async def send_transformed(bot, chat_id: int, html_text: str, *, media_paths: Op
                     caption = caption[:TELEGRAM_MAX_MESSAGE_LENGTH]
                 media_objs[0].caption = caption
                 media_objs[0].parse_mode = parse_mode
-                # send media group
-                async def _send_media():
-                    return await bot.send_media_group(chat_id=chat_id, media=media_objs)
 
-                try:
-                    res = await send_with_retries(_send_media)
-                    # send_media_group returns list of messages (one per media)
-                    sent.extend(res)
-                except Exception:
-                    LOG.exception("Failed to send media group to chat %s", chat_id)
-                    # fallback: try sending files individually with caption on first
-                    for idx, p in enumerate(media_paths):
-                        async def _send_file(path=p, caption_text=(chunks[0] if idx == 0 and chunks else None)):
-                            return await bot.send_document(chat_id=chat_id, document=open(path, 'rb'), caption=caption_text, parse_mode=parse_mode if caption_text else None)
-                        try:
-                            msg = await send_with_retries(_send_file)
-                            sent.append(msg)
-                        except Exception:
-                            LOG.exception("Failed to send file %s to chat %s", p, chat_id)
-                # consume first chunk since used as caption
-                if chunks:
-                    chunks = chunks[1:]
+            async def _send_media():
+                return await bot.send_media_group(chat_id=chat_id, media=media_objs)
+
+            try:
+                res = await send_with_retries(_send_media)
+                # send_media_group returns list of messages (one per media)
+                sent.extend(res)
+            except Exception:
+                LOG.exception("Failed to send media group to chat %s", chat_id)
+                # fallback: try sending files individually with caption on first
+                for idx, p in enumerate(media_paths):
+                    async def _send_file(path=p, caption_text=(chunks[0] if idx == 0 and chunks else None)):
+                        return await bot.send_document(chat_id=chat_id, document=open(path, "rb"), caption=caption_text, parse_mode=parse_mode if caption_text else None)
+                    try:
+                        msg = await send_with_retries(_send_file)
+                        sent.append(msg)
+                    except Exception:
+                        LOG.exception("Failed to send file %s to chat %s", p, chat_id)
+            finally:
+                # ensure we close opened file objects
+                for fh in file_objs:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+            # consume first chunk since used as caption
+            if chunks:
+                chunks = chunks[1:]
         except Exception:
             LOG.exception("Unable to send media group; continuing to send text chunks")
 
