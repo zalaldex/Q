@@ -5,18 +5,18 @@ handling retries, and optionally sending media groups with captions.
 Exports:
 - async send_with_retries(fn, *args, attempts=3, backoff_base=1.5)
 - async send_text_chunks(bot, chat_id, chunks, parse_mode='HTML') -> List[Message]
-- async send_transformed(bot, chat_id, html_text, *, media_paths=None, parse_mode='HTML') -> List[Message]
+- async send_transformed(bot, chat_id, html_text, *, media_paths=None, parse_mode='HTML') -> List[dict]
 
 Notes:
 - This module uses python-telegram-bot style Bot methods: send_message, send_media_group.
   It is best-effort and catches transient network errors, retrying with exponential backoff.
-- Returned Message objects are the objects returned by the Bot API when sending.
+- Returned values are normalized dicts with keys: telegram_message_id, chat_id, date, content
 """
 from __future__ import annotations
 
 import asyncio
 import random
-from typing import Any, Iterable, List, Optional, Callable, Awaitable
+from typing import Any, Iterable, List, Optional, Callable, Awaitable, Dict
 
 from .chunker import chunk_monospace_message
 from .constants import TELEGRAM_MAX_MESSAGE_LENGTH, SENDER_RETRY_ATTEMPTS, SENDER_BACKOFF_BASE
@@ -53,12 +53,38 @@ async def send_with_retries(
     raise last_exc
 
 
-async def send_text_chunks(bot, chat_id: int, chunks: Iterable[str], parse_mode: str = "HTML") -> List[Any]:
-    """Send each chunk as a separate message. Returns list of Message objects.
+def _normalize_message(msg: Any) -> Dict[str, Optional[str]]:
+    """Normalize a python-telegram-bot Message object into a dict for persistence.
+
+    Returns dict with keys: telegram_message_id (int), chat_id (int), date (iso str), content (text/caption)
+    """
+    try:
+        tm_id = getattr(msg, "message_id", None) or getattr(msg, "message_id", None)
+        chat = getattr(msg, "chat", None)
+        chat_id = None
+        if chat is not None:
+            chat_id = getattr(chat, "id", None)
+        # date is a datetime in PTB
+        date = getattr(msg, "date", None)
+        date_str = date.isoformat() if date is not None else None
+        content = getattr(msg, "text", None) or getattr(msg, "caption", None)
+        return {
+            "telegram_message_id": tm_id,
+            "chat_id": chat_id,
+            "date": date_str,
+            "content": content,
+        }
+    except Exception:
+        LOG.exception("Failed to normalize sent message object")
+        return {"telegram_message_id": None, "chat_id": None, "date": None, "content": None}
+
+
+async def send_text_chunks(bot, chat_id: int, chunks: Iterable[str], parse_mode: str = "HTML") -> List[Dict[str, Optional[str]]]:
+    """Send each chunk as a separate message. Returns list of normalized dicts for each sent message.
 
     This helper preserves order and tries to send each chunk with retries.
     """
-    results: List[Any] = []
+    results: List[Dict[str, Optional[str]]] = []
     for chunk in chunks:
         if not chunk:
             continue
@@ -68,7 +94,7 @@ async def send_text_chunks(bot, chat_id: int, chunks: Iterable[str], parse_mode:
 
         try:
             msg = await send_with_retries(_send)
-            results.append(msg)
+            results.append(_normalize_message(msg))
         except Exception:
             LOG.exception("Failed to send message chunk to chat %s", chat_id)
             # continue with remaining chunks; return what we sent so far
@@ -83,7 +109,7 @@ async def send_transformed(
     *,
     media_paths: Optional[List[str]] = None,
     parse_mode: str = "HTML",
-) -> List[Any]:
+) -> List[Dict[str, Optional[str]]]:
     """Send transformed HTML-safe monospace text, chunking it to fit limits.
 
     If media_paths is provided (list of local file paths), the function will attempt to
@@ -91,7 +117,7 @@ async def send_transformed(
     item when possible (caption size limited to TELEGRAM_MAX_MESSAGE_LENGTH). Remaining chunks
     (or when no media_paths) are sent as regular messages.
 
-    Returns a list of Message objects for all successfully sent messages.
+    Returns a list of normalized dicts for all successfully sent messages.
     """
     if not html_text:
         return []
@@ -157,8 +183,16 @@ async def send_transformed(
 
     # send remaining chunks as text messages
     text_msgs = await send_text_chunks(bot, chat_id, chunks, parse_mode=parse_mode)
-    sent.extend(text_msgs)
-    return sent
+    # text_msgs are already normalized dicts
+    # Normalize any Message objects in `sent` from media sends
+    normalized: List[Dict[str, Optional[str]]] = []
+    for m in sent:
+        try:
+            normalized.append(_normalize_message(m))
+        except Exception:
+            LOG.exception("Failed to normalize a sent media message")
+    normalized.extend(text_msgs)
+    return normalized
 
 
 __all__ = ["send_transformed", "send_text_chunks", "send_with_retries"]
