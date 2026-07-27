@@ -47,6 +47,21 @@ MIGRATIONS: List[Tuple[str, str]] = [
         );
         """,
     ),
+    (
+        "002_sent_messages",
+        """
+        CREATE TABLE IF NOT EXISTS sent_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            incoming_message_id INTEGER,
+            telegram_message_id INTEGER,
+            chat_id INTEGER,
+            date TEXT,
+            content TEXT,
+            FOREIGN KEY(incoming_message_id) REFERENCES messages(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sent_messages_telegram_id ON sent_messages(telegram_message_id);
+        """,
+    ),
 ]
 
 
